@@ -22,6 +22,9 @@ PRECISION_THRESHOLDS = {
     "float16": 2 ** -10,       # ≈ 9.77e-4
     "bfloat16": 2 ** -7,       # ≈ 7.81e-3
     "float32": 2 ** -13,       # ≈ 1.22e-4
+    "float64": 2 ** -30,       # ≈ 9.31e-10
+    "complex64": 2 ** -13,     # 实部/虚部各为 float32
+    "complex128": 2 ** -30,    # 实部/虚部各为 float64
     "hifloat32": 2 ** -11,     # ≈ 4.88e-4
     "float8_e4m3": 2 ** -3,    # ≈ 0.125
     "float8_e5m2": 2 ** -2,    # ≈ 0.25
@@ -58,12 +61,35 @@ def _get_threshold_for_tensor(t: torch.Tensor) -> float:
         torch.float16: "float16",
         torch.bfloat16: "bfloat16",
         torch.float32: "float32",
+        torch.float64: "float64",
+        torch.complex64: "complex64",
+        torch.complex128: "complex128",
     }
+    # 安全获取可能不存在的 dtype（取决于 PyTorch 版本）
+    _hifloat32 = getattr(torch, "hifloat32", None)
+    if _hifloat32 is not None:
+        dtype_map[_hifloat32] = "hifloat32"
+    _float8_e4m3fn = getattr(torch, "float8_e4m3fn", None)
+    if _float8_e4m3fn is not None:
+        dtype_map[_float8_e4m3fn] = "float8_e4m3"
+    _float8_e5m2 = getattr(torch, "float8_e5m2", None)
+    if _float8_e5m2 is not None:
+        dtype_map[_float8_e5m2] = "float8_e5m2"
+
     dtype_str = dtype_map.get(t.dtype)
-    if dtype_str is None:
-        # 非浮点类型使用一个宽松阈值
-        return 1e-2
-    return PRECISION_THRESHOLDS.get(dtype_str, 1e-2)
+    if dtype_str is not None:
+        return PRECISION_THRESHOLDS.get(dtype_str, 1e-2)
+
+    # 其他浮点类型回退到 float32 阈值
+    if torch.is_floating_point(t):
+        return PRECISION_THRESHOLDS.get("float32", 1e-2)
+
+    # 复数类型回退到对应浮点阈值
+    if t.is_complex():
+        return PRECISION_THRESHOLDS.get("float32", 1e-2)
+
+    # 非浮点类型使用宽松阈值
+    return 1e-2
 
 
 def _check_precision_mere_mare(actual: torch.Tensor, golden: torch.Tensor) -> tuple:
@@ -78,8 +104,22 @@ def _check_precision_mere_mare(actual: torch.Tensor, golden: torch.Tensor) -> tu
     threshold = _get_threshold_for_tensor(golden)
     mare_threshold = 10 * threshold
 
-    mere = _compute_mere(actual, golden)
-    mare = _compute_mare(actual, golden)
+    # NaN 处理：两者都为 NaN 的位置视为匹配并过滤；仅一方为 NaN 直接判定失败
+    actual_nan = torch.isnan(actual)
+    golden_nan = torch.isnan(golden)
+    if (actual_nan ^ golden_nan).any():
+        return False, float('inf'), float('inf'), threshold, mare_threshold
+
+    valid_mask = ~actual_nan  # 此时 actual_nan 与 golden_nan 等价
+    if valid_mask.any():
+        actual_valid = actual[valid_mask]
+        golden_valid = golden[valid_mask]
+    else:
+        # 所有元素均为双 NaN
+        return True, 0.0, 0.0, threshold, mare_threshold
+
+    mere = _compute_mere(actual_valid, golden_valid)
+    mare = _compute_mare(actual_valid, golden_valid)
 
     passed = mere < threshold and mare < mare_threshold
     return passed, mere, mare, threshold, mare_threshold
@@ -160,16 +200,35 @@ def _tensor_diff_summary(lhs: torch.Tensor, rhs: torch.Tensor):
     if lhs.shape != rhs.shape:
         return f"shape mismatch: ref={tuple(lhs.shape)}, cand={tuple(rhs.shape)}"
 
-    lhs_fp = torch.nan_to_num(lhs.to(torch.float32))
-    rhs_fp = torch.nan_to_num(rhs.to(torch.float32))
-    diff = (lhs_fp - rhs_fp).abs()
     total = lhs.numel()
-    max_abs = diff.max().item() if diff.numel() else 0.0
-    mean_abs = diff.mean().item() if diff.numel() else 0.0
 
-    passed, mere, mare, threshold, mare_threshold = _check_precision_mere_mare(rhs_fp, lhs_fp)
+    # 复数类型：分别比较实部/虚部
+    if lhs.is_complex() or rhs.is_complex():
+        passed_r, mere_r, mare_r, thr_r, mthr_r = _check_precision_mere_mare(rhs.real, lhs.real)
+        passed_i, mere_i, mare_i, thr_i, mthr_i = _check_precision_mere_mare(rhs.imag, lhs.imag)
+        # 用 view_as_real 计算绝对差值（转 float32 避免溢出）
+        lhs_fp = torch.view_as_real(lhs).to(torch.float32)
+        rhs_fp = torch.view_as_real(rhs).to(torch.float32)
+        diff = (lhs_fp - rhs_fp).abs()
+        max_abs = diff.max().item() if diff.numel() else 0.0
+        mean_abs = diff.mean().item() if diff.numel() else 0.0
+        return (
+            f"dtype(ref={lhs.dtype}, cand={rhs.dtype}), "
+            f"max_abs_diff={max_abs:.6g}, mean_abs_diff={mean_abs:.6g}, "
+            f"MERE(real={mere_r:.6g}, imag={mere_i:.6g}), "
+            f"MARE(real={mare_r:.6g}, imag={mare_i:.6g}), "
+            f"threshold={thr_r:.6g}, mare_threshold={mthr_r:.6g}, "
+            f"passed_real={passed_r}, passed_imag={passed_i}"
+        )
 
+    # 浮点类型
     if torch.is_floating_point(lhs) or torch.is_floating_point(rhs):
+        lhs_fp = torch.nan_to_num(lhs.to(torch.float32))
+        rhs_fp = torch.nan_to_num(rhs.to(torch.float32))
+        diff = (lhs_fp - rhs_fp).abs()
+        max_abs = diff.max().item() if diff.numel() else 0.0
+        mean_abs = diff.mean().item() if diff.numel() else 0.0
+        passed, mere, mare, threshold, mare_threshold = _check_precision_mere_mare(rhs, lhs)
         return (
             f"dtype(ref={lhs.dtype}, cand={rhs.dtype}), "
             f"max_abs_diff={max_abs:.6g}, mean_abs_diff={mean_abs:.6g}, "
@@ -227,17 +286,38 @@ def _compare_values(lhs, rhs, path: str = "output"):
         if lhs.shape != rhs.shape:
             return False, f"{path}: shape mismatch: ref={tuple(lhs.shape)}, cand={tuple(rhs.shape)}"
 
-        lhs_fp = torch.nan_to_num(lhs.to(torch.float32))
-        rhs_fp = torch.nan_to_num(rhs.to(torch.float32))
-
-        # 整数类型直接元素级相等判断
-        if not (torch.is_floating_point(lhs) or torch.is_floating_point(rhs)):
+        # 整数/布尔类型直接元素级相等判断
+        needs_numeric_check = (
+            torch.is_floating_point(lhs)
+            or torch.is_floating_point(rhs)
+            or lhs.is_complex()
+            or rhs.is_complex()
+        )
+        if not needs_numeric_check:
             if torch.equal(lhs, rhs):
                 return True, f"{path}: matched"
             return False, f"{path}: {_tensor_diff_summary(lhs, rhs)}"
 
+        # 复数类型：分别比较实部和虚部
+        if lhs.is_complex() or rhs.is_complex():
+            real_passed, real_mere, real_mare, real_thr, real_mthr = _check_precision_mere_mare(rhs.real, lhs.real)
+            imag_passed, imag_mere, imag_mare, imag_thr, imag_mthr = _check_precision_mere_mare(rhs.imag, lhs.imag)
+            passed = real_passed and imag_passed
+            mere = max(real_mere, imag_mere)
+            mare = max(real_mare, imag_mare)
+            threshold = real_thr
+            mare_threshold = real_mthr
+            if passed:
+                return True, (
+                    f"{path}: matched, "
+                    f"MERE(real={real_mere:.6g}, imag={imag_mere:.6g}), "
+                    f"MARE(real={real_mare:.6g}, imag={imag_mare:.6g}), "
+                    f"threshold={threshold:.6g}, mare_threshold={mare_threshold:.6g}"
+                )
+            return False, f"{path}: {_tensor_diff_summary(lhs, rhs)}"
+
         # 浮点类型使用 MERE/MARE 精度标准
-        passed, mere, mare, threshold, mare_threshold = _check_precision_mere_mare(rhs_fp, lhs_fp)
+        passed, mere, mare, threshold, mare_threshold = _check_precision_mere_mare(rhs, lhs)
         if passed:
             return True, (
                 f"{path}: matched, "

@@ -128,7 +128,12 @@ def _get_input_groups(output_dir: Path):
             if inp["type"] == "tensor":
                 dtype = dtype_map.get(inp["dtype"], torch.float32)
                 shape = inp["shape"]
-                t = torch.randn(shape, dtype=dtype) if dtype.is_floating_point else torch.randint(0, 10, shape, dtype=dtype)
+                if dtype == torch.bool:
+                    t = torch.randint(0, 2, shape, dtype=dtype)
+                elif dtype.is_floating_point:
+                    t = torch.randn(shape, dtype=dtype)
+                else:
+                    t = torch.randint(0, 10, shape, dtype=dtype)
                 group.append(t)
             elif inp["type"] == "attr":
                 if inp["dtype"] in ("float", "double"):
