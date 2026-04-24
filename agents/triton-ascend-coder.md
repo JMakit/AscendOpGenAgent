@@ -198,6 +198,7 @@ while iteration < max_iterations:
 
     验证通过 (exit 0 且 passed == total):
       复制 iter_{iteration}/generated_code.py → {工作目录}/output/generated_code.py
+      记录 phase3_last_iter = iteration  # 供 Phase 4 复用基线结果
       → 跳到 3.5 性能测试
 
     验证失败 (exit 非 0 或 passed < total):
@@ -313,6 +314,7 @@ opt_iteration = 0
 best_code = ""
 best_speedup = 0.0
 baseline_code = Phase 3 产出的 generated_code.py
+phase3_last_iter = Phase 3 最后一次验证通过的 iter 编号  # 见 3.3 的记录
 improvement_made = false
 ```
 
@@ -338,29 +340,45 @@ while True:
     
     复制 → {工作目录}/output/optimized_code.py
 
-    ── 4.2 双重验证 ──────────────────────────────────
-    调用 kernel-verifier skill 执行两次精度比对
+    ── 4.2 精度验证（基线复用 + 优化侧单次执行）──────
+    调用 kernel-verifier skill 执行一次精度比对
 
     在 {工作目录}/output/opt_iter_{opt_iteration}/verify/ 下创建:
       - {op_name}_torch.py              (PyTorch 参考)
-      - {op_name}_triton_baseline.py    (Phase 3 基线)
+      - {op_name}_triton_baseline.py    (Phase 3 基线，保留以便复盘)
       - {op_name}_triton_optimized.py   (优化后)
 
-    第一次: verify.py --triton_impl_name triton_baseline  →  verify_result_baseline.json
-    第二次: verify.py --triton_impl_name triton_optimized →  verify_result_optimized.json
+    基线侧：直接复制 Phase 3 iter_{phase3_last_iter} 的校验结果，不再重跑
+      cp {工作目录}/output/iter_{phase3_last_iter}/verify/verify_result.json \
+         {工作目录}/output/opt_iter_{opt_iteration}/verify/verify_result_baseline.json
 
-    **策略 A 判定**：两次均要求 `passed_cases == total_cases`。
-      两者都全过 → 继续 4.3
-      任一未全过 → 跳到 4.5（视为 A 类，记录两份 verify_result.json 的 failures 清单供优化器分析）
+      ⚠️ 基线代码等于 Phase 3 产出的 generated_code.py，Phase 3.3 已经严格校验
+      过 passed == total，无需在 Phase 4 重复执行 verify.py。
+      verify_result_baseline.json 内容中不含 triton 实现模块名字段，原样复制即可。
 
-    ── 4.3 双重性能测试 ──────────────────────────────
-    调用 kernel-verifier skill (benchmark.py) 两次
+    优化侧：verify.py --triton_impl_name triton_optimized → verify_result_optimized.json
 
-    **GPU Kernel 模式**：两次 benchmark 均需附加 `--skip_framework --framework_latency_ms <gpu_reference_ms>`，其中 `gpu_reference_ms` 从 `vllm_gpu_perf.csv` 读取并转换为毫秒。非 GPU 模式保持原样。
+    **策略 A 判定**：
+      baseline 视为已通过（来自 Phase 3，已确认 passed == total）
+      optimized 要求 `passed_cases == total_cases`
+      optimized 全过 → 继续 4.3
+      optimized 未全过 → 跳到 4.5（A 类，读取 verify_result_optimized.json 的 failures 供优化器分析）
 
-    第一次: benchmark.py --triton_impl_name triton_baseline [--skip_framework ...]
-      → baseline_perf_result.json
-    第二次: benchmark.py --triton_impl_name triton_optimized [--skip_framework ...]
+    ── 4.3 性能测试（基线复用 + 优化侧单次执行）──────
+    调用 kernel-verifier skill (benchmark.py) 一次，仅测试优化侧
+
+    基线侧：直接复制 Phase 3 iter_{phase3_last_iter} 的性能结果，不再重跑
+      cp {工作目录}/output/iter_{phase3_last_iter}/perf_result.json \
+         {工作目录}/output/opt_iter_{opt_iteration}/baseline_perf_result.json
+
+      ⚠️ 基线代码等于 Phase 3 产出的 generated_code.py，Phase 3.5 已完成过完整
+      benchmark，再跑一次只会得到等价结果并消耗时间。perf_result.json 内容中不含
+      `triton_impl_name` 字段，原样复制即可；下游判定仅依赖 `total_implementation_latency_ms`
+      等数值字段，不关心文件名前缀。
+
+    **GPU Kernel 模式**：优化侧 benchmark 仍需附加 `--skip_framework --framework_latency_ms <gpu_reference_ms>`，其中 `gpu_reference_ms` 从 `vllm_gpu_perf.csv` 读取并转换为毫秒。非 GPU 模式保持原样。基线侧因为是复制 Phase 3 结果，天然继承 Phase 3 时的参数配置，无需额外处理。
+
+    优化侧: benchmark.py --triton_impl_name triton_optimized [--skip_framework ...]
       → optimized_perf_result.json
 
     **延时加权判定（sum ratio）**：
@@ -373,8 +391,8 @@ while True:
     speedup_vs_baseline = baseline_total / optimized_total
     ```
 
-    策略 A 下 4.2 已保证两侧均 passed == total，故集合相同，可直接相除。
-    若出现集合不一致（兼容路径），应直接判优化失败，不写入比较数值。
+    策略 A 下 4.2 已保证 optimized 侧 passed == total，baseline 来自 Phase 3 同样 passed == total，
+    集合相同，可直接相除。若出现集合不一致（兼容路径），应直接判优化失败，不写入比较数值。
     
     ── 4.4 结果判定 ──────────────────────────────────
     speedup_vs_baseline ≥ 1.0:
@@ -580,10 +598,10 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 │   │   │   ├── {op_name}_torch.py
 │   │   │   ├── {op_name}_triton_baseline.py
 │   │   │   ├── {op_name}_triton_optimized.py
-│   │   │   ├── verify_result_baseline.json
-│   │   │   └── verify_result_optimized.json
-│   │   ├── baseline_perf_result.json
-│   │   ├── optimized_perf_result.json
+│   │   │   ├── verify_result_baseline.json   # 复制自 iter_{phase3_last_iter}/verify/verify_result.json
+│   │   │   └── verify_result_optimized.json  # 本轮 verify.py 实际产出
+│   │   ├── baseline_perf_result.json         # 复制自 iter_{phase3_last_iter}/perf_result.json
+│   │   ├── optimized_perf_result.json        # 本轮 benchmark.py 实际产出
 │   │   └── log.md
 │   └── opt_iter_1/                       # Phase 4 第 1 轮（如有）
 │       └── ...
@@ -620,6 +638,7 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 | Phase 4 迭代策略 | 不做最大迭代次数限制，直到 latency-optimizer 报告无更多优化点则退出 |
 | Phase 4 成功底线 | 性能不劣化（speedup_vs_baseline ≥ 1.0） |
 | Phase 4 退出判定 | 有效果（speedup_vs_baseline ≥ 1.0）则成功；做完所有尝试后无效果则失败 |
+| Phase 4 基线复用 | 4.2/4.3 的基线侧 verify_result_baseline.json 和 baseline_perf_result.json 必须从 Phase 3 iter_{phase3_last_iter} 复制，禁止对基线代码重跑 verify.py 或 benchmark.py（基线代码与 Phase 3 generated_code.py 完全一致，重复执行只浪费时间） |
 | A 类连续上限 | 同一子类型连续 ≥ 3 次 → 自动终止 |
 | 禁止 PyTorch 退化 | forward() 中禁止 torch.*/F.* 计算操作 |
 | 文件操作范围 | 限制在工作目录内 |
