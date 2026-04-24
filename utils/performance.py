@@ -94,7 +94,25 @@ def _synchronize(device):
         torch.npu.synchronize()
 
 
-def _get_input_groups(output_dir: Path):
+def _extract_scalar_from_json(inp: dict):
+    """从 JSON scalar/attr 描述中提取具体值（兼容 range_values 回退）。"""
+    val = inp.get("value")
+    if val is not None:
+        return val
+    rv = inp.get("range_values")
+    if isinstance(rv, (int, float, bool, str)):
+        return rv
+    if isinstance(rv, list) and len(rv) > 0:
+        return rv[0]
+    dtype = inp.get("dtype", "")
+    if dtype == "bool":
+        return True
+    if dtype.startswith("int") or dtype.startswith("uint"):
+        return 1
+    return 1.0
+
+
+def _get_input_groups_from_json(output_dir: Path):
     """从 output_dir 下的 .json 文件读取输入 cases。"""
     json_files = sorted(output_dir.glob("*.json"))
     json_path = None
@@ -110,14 +128,24 @@ def _get_input_groups(output_dir: Path):
 
     dtype_map = {
         "float32": torch.float32,
+        "fp32": torch.float32,
         "float16": torch.float16,
+        "fp16": torch.float16,
         "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float64": torch.float64,
+        "fp64": torch.float64,
         "int8": torch.int8,
         "int16": torch.int16,
         "int32": torch.int32,
         "int64": torch.int64,
         "uint8": torch.uint8,
+        "uint16": torch.uint16,
+        "uint32": torch.uint32,
+        "uint64": torch.uint64,
         "bool": torch.bool,
+        "complex64": torch.complex64,
+        "complex128": torch.complex128,
     }
 
     input_groups = []
@@ -132,21 +160,46 @@ def _get_input_groups(output_dir: Path):
                     t = torch.randint(0, 2, shape, dtype=dtype)
                 elif dtype.is_floating_point:
                     t = torch.randn(shape, dtype=dtype)
+                elif str(inp.get("dtype", "")).startswith("uint"):
+                    t = torch.randint(0, 10, shape, dtype=torch.int64).to(dtype)
+                elif str(inp.get("dtype", "")).startswith("int"):
+                    t = torch.randint(-10, 10, shape, dtype=dtype)
+                elif str(inp.get("dtype", "")).startswith("complex"):
+                    t = torch.randn(shape, dtype=dtype)
                 else:
-                    t = torch.randint(0, 10, shape, dtype=dtype)
+                    t = torch.randn(shape, dtype=dtype)
                 group.append(t)
-            elif inp["type"] == "attr":
-                if inp["dtype"] in ("float", "double"):
-                    group.append(float(inp.get("value", 0.0)))
-                elif inp["dtype"] in ("int", "int64", "int32"):
-                    group.append(int(inp.get("value", 0)))
+            elif inp["type"] in ("attr", "scalar"):
+                val = _extract_scalar_from_json(inp)
+                dtype = inp.get("dtype", "")
+                if dtype == "bool":
+                    group.append(bool(val))
+                elif dtype in ("float", "double", "fp32", "fp64", "float32", "float64"):
+                    group.append(float(val))
+                elif dtype in ("int", "int64", "int32", "int16", "int8", "uint8", "uint16", "uint32", "uint64"):
+                    group.append(int(val))
+                elif str(dtype).startswith("complex"):
+                    group.append(complex(val))
                 else:
-                    group.append(inp.get("value"))
+                    group.append(val)
             else:
                 group.append(inp.get("value"))
         input_groups.append(group)
 
     return input_groups, str(json_path)
+
+
+def _get_input_groups_from_module(module):
+    """优先使用 model.py 自带的 get_input_groups / get_inputs 生成输入。"""
+    if hasattr(module, "get_input_groups"):
+        groups = module.get_input_groups()
+        if isinstance(groups, list) and groups:
+            return groups
+    if hasattr(module, "get_inputs"):
+        inputs = module.get_inputs()
+        if isinstance(inputs, list) and inputs:
+            return [inputs]
+    return None
 
 
 def _load_impl(output_dir: Path, impl: str):
@@ -358,7 +411,20 @@ def run_performance(output_dir: str, warmup: int = WARMUP_DEFAULT, repeats: int 
     asc_module, asc_cls, asc_path = _load_impl(output_dir_path, "ascendc")
 
     init_inputs = getattr(ref_module, "get_init_inputs", lambda: [])()
-    input_groups, json_path = _get_input_groups(output_dir_path)
+
+    # 优先使用 model.py 自带的输入生成函数，否则回退到 JSON 解析
+    input_groups = _get_input_groups_from_module(ref_module)
+    if input_groups is not None:
+        json_files = sorted(output_dir_path.glob("*.json"))
+        json_path = None
+        for f in json_files:
+            if not f.name.endswith("_all_case.json") and not f.name.endswith(".json.bak"):
+                json_path = str(f)
+                break
+        if json_path is None:
+            json_path = str(output_dir_path / f"{output_dir_path.name}.json")
+    else:
+        input_groups, json_path = _get_input_groups_from_json(output_dir_path)
 
     report = {
         "op": output_dir_path.name,

@@ -110,12 +110,23 @@ def _check_precision_mere_mare(actual: torch.Tensor, golden: torch.Tensor) -> tu
     if (actual_nan ^ golden_nan).any():
         return False, float('inf'), float('inf'), threshold, mare_threshold
 
-    valid_mask = ~actual_nan  # 此时 actual_nan 与 golden_nan 等价
+    # Inf 处理：两者都为 Inf 且同号的位置视为匹配并过滤；仅一方为 Inf 或符号不同直接判定失败
+    actual_inf = torch.isinf(actual)
+    golden_inf = torch.isinf(golden)
+    if (actual_inf ^ golden_inf).any():
+        return False, float('inf'), float('inf'), threshold, mare_threshold
+    if actual_inf.any():
+        actual_sign = torch.sign(actual[actual_inf])
+        golden_sign = torch.sign(golden[actual_inf])
+        if not torch.equal(actual_sign, golden_sign):
+            return False, float('inf'), float('inf'), threshold, mare_threshold
+
+    valid_mask = ~(actual_nan | actual_inf)
     if valid_mask.any():
         actual_valid = actual[valid_mask]
         golden_valid = golden[valid_mask]
     else:
-        # 所有元素均为双 NaN
+        # 所有元素均为双 NaN 或双 Inf
         return True, 0.0, 0.0, threshold, mare_threshold
 
     mere = _compute_mere(actual_valid, golden_valid)
@@ -226,6 +237,9 @@ def _tensor_diff_summary(lhs: torch.Tensor, rhs: torch.Tensor):
         lhs_fp = torch.nan_to_num(lhs.to(torch.float32))
         rhs_fp = torch.nan_to_num(rhs.to(torch.float32))
         diff = (lhs_fp - rhs_fp).abs()
+        # 过滤同位置同号 inf（inf - inf = nan），避免污染 diff 统计
+        both_inf_mask = torch.isinf(lhs_fp) & torch.isinf(rhs_fp) & (torch.sign(lhs_fp) == torch.sign(rhs_fp))
+        diff[both_inf_mask] = 0.0
         max_abs = diff.max().item() if diff.numel() else 0.0
         mean_abs = diff.mean().item() if diff.numel() else 0.0
         passed, mere, mare, threshold, mare_threshold = _check_precision_mere_mare(rhs, lhs)
@@ -243,6 +257,7 @@ def _tensor_diff_summary(lhs: torch.Tensor, rhs: torch.Tensor):
     delta = rhs_i32 - lhs_i32
     abs_diff = delta.abs()
     max_abs = abs_diff.max().item() if abs_diff.numel() else 0
+    mean_abs = abs_diff.float().mean().item() if abs_diff.numel() else 0.0
     mismatch_mask = delta != 0
     mismatch_count = mismatch_mask.sum().item() if delta.numel() else 0
     mismatch_ratio = (mismatch_count / total) if total else 0.0
